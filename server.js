@@ -136,7 +136,7 @@ async function handleStream(type, rawId) {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+async function handler(req, res) {
   const send = (code, body, type = 'application/json') => {
     res.writeHead(code, {
       'Content-Type': type,
@@ -146,7 +146,11 @@ const server = http.createServer(async (req, res) => {
     res.end(typeof body === 'string' ? body : JSON.stringify(body));
   };
   if (req.method === 'OPTIONS') return send(204, '');
-  const path = new URL(req.url, 'http://x').pathname;
+  const u = new URL(req.url, 'http://x');
+  let path = u.pathname;
+  // On Vercel, requests are rewritten to /api/index?path=<original path>
+  const qp = u.searchParams.get('path');
+  if (qp !== null) path = '/' + qp.replace(/^\/+/, '');
 
   if (path === '/manifest.json') return send(200, manifest);
   let m = path.match(/^\/stream\/([^/]+)\/(.+)$/);
@@ -161,9 +165,11 @@ const server = http.createServer(async (req, res) => {
 <p dir="ltr"><code>http://${host}/manifest.json</code></p></body>`, 'text/html; charset=utf-8');
   }
   send(404, { error: 'not found' });
-});
+}
+
+const server = http.createServer(handler);
 
 if (require.main === module) {
   server.listen(PORT, () => console.log(`Nudity Guard: http://127.0.0.1:${PORT}/manifest.json`));
 }
-module.exports = { parseParentsGuide, buildStream, server };
+module.exports = { parseParentsGuide, buildStream, server, handler };
