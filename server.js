@@ -152,6 +152,27 @@ async function handler(req, res) {
   const qp = u.searchParams.get('path');
   if (qp !== null) path = '/' + qp.replace(/^\/+/, '');
 
+  if (path === '/probe') {
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+    const H = { 'User-Agent': UA, 'Accept': 'text/html,application/json,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };
+    const targets = {
+      imdb_www: ['https://www.imdb.com/title/tt0133093/parentalguide', {}],
+      imdb_mobile: ['https://m.imdb.com/title/tt0133093/parentalguide', {}],
+      imdb_graphql: ['https://api.graphql.imdb.com/?query=' + encodeURIComponent('{title(id:"tt0133093"){titleText{text}}}'), { 'Content-Type': 'application/json' }],
+      kids_in_mind: ['https://kids-in-mind.com/m/matrix-the.htm', {}],
+      common_sense: ['https://www.commonsensemedia.org/movie-reviews/the-matrix', {}],
+      dtdd: ['https://www.doesthedogdie.com/', {}],
+    };
+    const out = {};
+    await Promise.all(Object.entries(targets).map(async ([k, [url, extra]]) => {
+      try {
+        const r = await fetch(url, { headers: { ...H, ...extra }, signal: AbortSignal.timeout(7000) });
+        const b = await r.text();
+        out[k] = { status: r.status, length: b.length, start: b.slice(0, 160).replace(/\s+/g, ' ') };
+      } catch (e) { out[k] = { error: String(e).slice(0, 120) }; }
+    }));
+    return send(200, out);
+  }
   const dbg = path.match(/^\/debug\/(tt\d+)$/);
   if (dbg) {
     try {
