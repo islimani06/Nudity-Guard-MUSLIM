@@ -1,23 +1,24 @@
 // Nudity Guard — Stremio addon (no dependencies, Node 18+)
-// Shows the IMDb Parents Guide "Sex & Nudity" severity as the FIRST stream entry
-// for any movie/series, so you see a warning before choosing a source.
-//
-// Run:  node server.js        (default port 7000)
-// Install in Stremio: http://127.0.0.1:7000/manifest.json
+// Source: Common Sense Media "Sex, Romance & Nudity" rating (0-5 + short description).
+// Title lookup: Stremio's Cinemeta (IMDb id -> name/year).
+// Shows the warning as the first entry in the stream list for any movie/series.
 
 const http = require('http');
 
 const PORT = Number(process.env.PORT || 7000);
-const IMDB_BASE = process.env.IMDB_BASE || 'https://www.imdb.com';
+const CSM_BASE = process.env.CSM_BASE || 'https://www.commonsensemedia.org';
+const CINEMETA_BASE = process.env.CINEMETA_BASE || 'https://v3-cinemeta.strem.io';
 const CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
-const cache = new Map(); // imdbId -> { at, data }
+const cache = new Map();
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const HEADERS = { 'User-Agent': UA, 'Accept': 'text/html,application/json,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };
 
 const manifest = {
   id: 'community.nudity.guard',
-  version: '1.0.0',
+  version: '2.0.0',
   name: 'Nudity Guard',
-  description:
-    'تحذير قبل المشاهدة: يعرض مستوى "الجنس والعري" (من IMDb Parents Guide) كأول عنصر في قائمة المصادر لأي فيلم أو مسلسل.',
+  description: 'تحذير قبل المشاهدة: مستوى "الجنس والعري" (من Common Sense Media) كأول عنصر في قائمة المصادر.',
   resources: ['stream'],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
@@ -25,111 +26,106 @@ const manifest = {
   behaviorHints: { configurable: false },
 };
 
-const LEVELS = {
-  none: { icon: '🟢', ar: 'لا يوجد', rank: 0 },
-  mild: { icon: '🟡', ar: 'خفيف', rank: 1 },
-  moderate: { icon: '🟠', ar: 'متوسط', rank: 2 },
-  severe: { icon: '🔴', ar: 'شديد', rank: 3 },
-  unknown: { icon: '⚪', ar: 'غير معروف (لا توجد بيانات)', rank: -1 },
-};
+// ---------- helpers ----------
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'").replace(/&amp;/g, '&');
+}
+function stripTags(s) { return decodeEntities(s).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); }
 
-// ---------- IMDb parsing ----------
-function findNudityCategory(node) {
-  if (!node || typeof node !== 'object') return null;
-  if (Array.isArray(node)) {
-    for (const x of node) { const r = findNudityCategory(x); if (r) return r; }
-    return null;
-  }
-  const cat = node.category;
-  if (cat && typeof cat === 'object' && String(cat.id).toUpperCase() === 'NUDITY') return node;
-  for (const k of Object.keys(node)) {
-    const r = findNudityCategory(node[k]);
-    if (r) return r;
-  }
-  return null;
+function slugify(name) {
+  return String(name).toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/&/g, ' and ').replace(/['’`]/g, '')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
-function normalizeLevel(text) {
-  const t = String(text || '').toLowerCase();
-  if (t.includes('none')) return 'none';
-  if (t.includes('mild')) return 'mild';
-  if (t.includes('moderate')) return 'moderate';
-  if (t.includes('severe')) return 'severe';
-  return 'unknown';
+function levelFor(score) {
+  if (score <= 0) return { icon: '🟢', ar: 'لا يوجد', warn: false };
+  if (score <= 2) return { icon: '🟡', ar: 'خفيف', warn: false };
+  if (score === 3) return { icon: '🟠', ar: 'متوسط', warn: true };
+  return { icon: '🔴', ar: 'شديد', warn: true };
 }
 
-function parseParentsGuide(html) {
-  const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
-  if (m) {
-    try {
-      const cat = findNudityCategory(JSON.parse(m[1]));
-      if (cat) {
-        const level = normalizeLevel(cat.severity && (cat.severity.text || cat.severity.id));
-        const votes = Array.isArray(cat.severityBreakdown) ? cat.severityBreakdown : [];
-        const total = votes.reduce((s, v) => s + (v.voteCount || 0), 0);
-        const items = (cat.guideItems && cat.guideItems.edges) || [];
-        const sample = items.map(e => e.node && e.node.text && e.node.text.plaidHtml)
-          .filter(Boolean)[0];
-        return {
-          level,
-          votes: total,
-          sample: sample ? sample.replace(/<[^>]+>/g, '').slice(0, 220) : null,
-        };
-      }
-    } catch (_) { /* fall through to HTML heuristic */ }
+// Parse Common Sense Media page: score = number of active circles in the sex/nudity block.
+function parseCsm(html) {
+  const i = html.indexOf('id="content-grid-item-sex"');
+  if (i < 0) return null;
+  const chunk = html.slice(i, i + 4000);
+  const sc = chunk.match(/rating__score[\s\S]*?<\/span>/);
+  if (!sc) return null;
+  const score = (sc[0].match(/icon-circle-solid active/g) || []).length;
+  const tz = chunk.match(/rating__teaser">\s*<p>([\s\S]*?)<\/p>/);
+  let text = tz ? stripTags(tz[1]) : null;
+  if (!text) {
+    const before = html.slice(Math.max(0, i - 800), i).match(/data-text="([^"]*)"/g);
+    if (before) text = stripTags(before[before.length - 1].replace(/^data-text="|"$/g, ''));
   }
-  // Fallback: look for the severity word near "Sex & Nudity"
-  const idx = html.search(/Sex\s*&(amp;)?\s*Nudity/i);
-  if (idx >= 0) {
-    const chunk = html.slice(idx, idx + 1500);
-    const w = chunk.match(/\b(None|Mild|Moderate|Severe)\b/);
-    if (w) return { level: normalizeLevel(w[1]), votes: 0, sample: null };
-  }
-  return { level: 'unknown', votes: 0, sample: null };
+  return { score, text };
 }
 
-async function getGuide(imdbId) {
-  const hit = cache.get(imdbId);
+async function fetchText(url, ms) {
+  const r = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(ms) });
+  if (!r.ok) return null;
+  return r.text();
+}
+
+async function lookup(type, imdbId) {
+  const key = type + ':' + imdbId;
+  const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.data;
-  const res = await fetch(`${IMDB_BASE}/title/${imdbId}/parentalguide`, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-    signal: AbortSignal.timeout(8000),
-  });
-  if (!res.ok) throw new Error(`IMDb responded ${res.status}`);
-  const data = parseParentsGuide(await res.text());
-  if (data.level !== 'unknown') cache.set(imdbId, { at: Date.now(), data });
-  return data;
+
+  const metaRes = await fetchText(`${CINEMETA_BASE}/meta/${type}/${imdbId}.json`, 4000);
+  const meta = metaRes ? JSON.parse(metaRes).meta : null;
+  if (!meta || !meta.name) return { found: false, name: null };
+
+  const slug = slugify(meta.name);
+  const year = String(meta.year || meta.releaseInfo || '').match(/\d{4}/);
+  const kind = type === 'series' ? 'tv-reviews' : 'movie-reviews';
+  const candidates = [slug];
+  if (year) candidates.push(`${slug}-${year[0]}`);
+  if (slug.startsWith('the-')) candidates.push(slug.slice(4));
+
+  const pages = await Promise.all(candidates.map(async (c) => {
+    try { return await fetchText(`${CSM_BASE}/${kind}/${c}`, 5000); } catch (_) { return null; }
+  }));
+  for (let k = 0; k < pages.length; k++) {
+    const p = pages[k] && parseCsm(pages[k]);
+    if (p) {
+      const data = { found: true, name: meta.name, score: p.score, text: p.text, url: `${CSM_BASE}/${kind}/${candidates[k]}` };
+      cache.set(key, { at: Date.now(), data });
+      return data;
+    }
+  }
+  return { found: false, name: meta.name };
 }
 
 // ---------- Stremio protocol ----------
-function buildStream(imdbId, g) {
-  const L = LEVELS[g.level] || LEVELS.unknown;
-  const warn = L.rank >= 2 ? '⚠️ ' : '';
-  const lines = [`${warn}الجنس والعري: ${L.icon} ${L.ar}`];
-  if (g.votes) lines.push(`(${g.votes} تصويت على IMDb)`);
-  if (g.sample) lines.push(g.sample);
-  return {
-    name: 'Nudity Guard',
-    title: lines.join('\n'),
-    description: lines.join('\n'),
-    externalUrl: `https://www.imdb.com/title/${imdbId}/parentalguide`,
-  };
+function buildStream(d) {
+  if (!d.found) {
+    const q = encodeURIComponent(d.name || '');
+    const t = '⚪ الجنس والعري: غير متوفر لهذا العمل في Common Sense Media';
+    return { name: 'Nudity Guard', title: t, description: t, externalUrl: `${CSM_BASE}/search/${q}` };
+  }
+  const L = levelFor(d.score);
+  const lines = [`${L.warn ? '⚠️ ' : ''}الجنس والعري: ${L.icon} ${L.ar} (${d.score}/5)`];
+  if (d.text) lines.push(d.text.slice(0, 220));
+  return { name: 'Nudity Guard', title: lines.join('\n'), description: lines.join('\n'), externalUrl: d.url };
 }
 
 async function handleStream(type, rawId) {
   const imdbId = decodeURIComponent(rawId).replace(/\.json$/, '').split(':')[0];
-  if (!/^tt\d+$/.test(imdbId)) return { streams: [] };
+  if (!/^tt\d+$/.test(imdbId) || (type !== 'movie' && type !== 'series')) return { streams: [] };
   try {
-    return { streams: [buildStream(imdbId, await getGuide(imdbId))], cacheMaxAge: 3600 };
+    const d = await lookup(type, imdbId);
+    return { streams: [buildStream(d)], cacheMaxAge: d.found ? 3600 : 600 };
   } catch (e) {
     return {
       streams: [{
         name: 'Nudity Guard',
-        title: '⚪ تعذر جلب التحذير الآن — اضغط للتحقق يدوياً',
-        externalUrl: `https://www.imdb.com/title/${imdbId}/parentalguide`,
+        title: '⚪ تعذر جلب التحذير الآن',
+        externalUrl: `${CSM_BASE}/search/`,
       }],
       cacheMaxAge: 60,
     };
@@ -152,82 +148,8 @@ async function handler(req, res) {
   const qp = u.searchParams.get('path');
   if (qp !== null) path = '/' + qp.replace(/^\/+/, '');
 
-  if (path === '/probe2') {
-    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-    const H = { 'User-Agent': UA, 'Accept': 'text/html,application/json,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };
-    const out = {};
-    try {
-      const r = await fetch('https://v3-cinemeta.strem.io/meta/movie/tt0133093.json', { headers: H, signal: AbortSignal.timeout(7000) });
-      const j = await r.json();
-      out.cinemeta = { status: r.status, name: j.meta && j.meta.name, year: j.meta && j.meta.year };
-    } catch (e) { out.cinemeta = { error: String(e).slice(0, 120) }; }
-    try {
-      const r = await fetch('https://www.commonsensemedia.org/movie-reviews/the-matrix', { headers: H, signal: AbortSignal.timeout(8000) });
-      const b = await r.text();
-      out.csm = { status: r.status, length: b.length, hasLdJson: b.includes('application/ld+json') };
-      const hits = [];
-      const re = /Sex,?\s*(Romance)?[^<]{0,20}Nudity/gi;
-      let m;
-      while ((m = re.exec(b)) && hits.length < 3) hits.push(b.slice(Math.max(0, m.index - 300), m.index + 700));
-      out.csm.around = hits;
-      const t = b.match(/<title>([^<]*)<\/title>/);
-      out.csm.title = t && t[1];
-    } catch (e) { out.csm = { error: String(e).slice(0, 120) }; }
-    try {
-      const r = await fetch('https://www.commonsensemedia.org/search/the%20matrix', { headers: H, signal: AbortSignal.timeout(8000) });
-      const b = await r.text();
-      out.csmSearch = { status: r.status, length: b.length, links: (b.match(/\/(movie|tv)-reviews\/[a-z0-9-]+/g) || []).slice(0, 8) };
-    } catch (e) { out.csmSearch = { error: String(e).slice(0, 120) }; }
-    return send(200, out);
-  }
-  if (path === '/probe') {
-    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-    const H = { 'User-Agent': UA, 'Accept': 'text/html,application/json,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };
-    const targets = {
-      imdb_www: ['https://www.imdb.com/title/tt0133093/parentalguide', {}],
-      imdb_mobile: ['https://m.imdb.com/title/tt0133093/parentalguide', {}],
-      imdb_graphql: ['https://api.graphql.imdb.com/?query=' + encodeURIComponent('{title(id:"tt0133093"){titleText{text}}}'), { 'Content-Type': 'application/json' }],
-      kids_in_mind: ['https://kids-in-mind.com/m/matrix-the.htm', {}],
-      common_sense: ['https://www.commonsensemedia.org/movie-reviews/the-matrix', {}],
-      dtdd: ['https://www.doesthedogdie.com/', {}],
-    };
-    const out = {};
-    await Promise.all(Object.entries(targets).map(async ([k, [url, extra]]) => {
-      try {
-        const r = await fetch(url, { headers: { ...H, ...extra }, signal: AbortSignal.timeout(7000) });
-        const b = await r.text();
-        out[k] = { status: r.status, length: b.length, start: b.slice(0, 160).replace(/\s+/g, ' ') };
-      } catch (e) { out[k] = { error: String(e).slice(0, 120) }; }
-    }));
-    return send(200, out);
-  }
-  const dbg = path.match(/^\/debug\/(tt\d+)$/);
-  if (dbg) {
-    try {
-      const r = await fetch(`${IMDB_BASE}/title/${dbg[1]}/parentalguide`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-        signal: AbortSignal.timeout(8000),
-      });
-      const body = await r.text();
-      const i = body.search(/NUDITY|Sex\s*&(amp;)?\s*Nudity/i);
-      return send(200, {
-        status: r.status,
-        length: body.length,
-        hasNextData: body.includes('__NEXT_DATA__'),
-        title: (body.match(/<title>([^<]*)<\/title>/) || [])[1] || null,
-        start: body.slice(0, 300),
-        aroundNudity: i >= 0 ? body.slice(Math.max(0, i - 200), i + 600) : null,
-        parsed: parseParentsGuide(body),
-      });
-    } catch (e) {
-      return send(200, { error: String(e) });
-    }
-  }
   if (path === '/manifest.json') return send(200, manifest);
-  let m = path.match(/^\/stream\/([^/]+)\/(.+)$/);
+  const m = path.match(/^\/stream\/([^/]+)\/(.+)$/);
   if (m) return send(200, await handleStream(m[1], m[2]));
   if (path === '/') {
     const host = req.headers.host || `127.0.0.1:${PORT}`;
@@ -236,20 +158,19 @@ async function handler(req, res) {
 <body style="font-family:sans-serif;max-width:560px;margin:3rem auto;padding:0 1rem" dir="rtl">
 <h1>Nudity Guard</h1><p>${manifest.description}</p>
 <p><a href="stremio://${host}/manifest.json">تثبيت في Stremio</a></p>
-<p dir="ltr"><code>http://${host}/manifest.json</code></p></body>`, 'text/html; charset=utf-8');
+<p dir="ltr"><code>https://${host}/manifest.json</code></p></body>`, 'text/html; charset=utf-8');
   }
   send(404, { error: 'not found' });
 }
 
 const server = http.createServer(handler);
-
 if (require.main === module) {
   server.listen(PORT, () => console.log(`Nudity Guard: http://127.0.0.1:${PORT}/manifest.json`));
 }
-// Export the request handler itself as the default export: Vercel (and similar hosts)
-// require the default export to be a function.
+
+// Vercel requires the default export to be a function.
 module.exports = handler;
 module.exports.handler = handler;
-module.exports.parseParentsGuide = parseParentsGuide;
-module.exports.buildStream = buildStream;
+module.exports.parseCsm = parseCsm;
+module.exports.slugify = slugify;
 module.exports.server = server;
