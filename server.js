@@ -152,6 +152,31 @@ async function handler(req, res) {
   const qp = u.searchParams.get('path');
   if (qp !== null) path = '/' + qp.replace(/^\/+/, '');
 
+  const dbg = path.match(/^\/debug\/(tt\d+)$/);
+  if (dbg) {
+    try {
+      const r = await fetch(`${IMDB_BASE}/title/${dbg[1]}/parentalguide`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      const body = await r.text();
+      const i = body.search(/NUDITY|Sex\s*&(amp;)?\s*Nudity/i);
+      return send(200, {
+        status: r.status,
+        length: body.length,
+        hasNextData: body.includes('__NEXT_DATA__'),
+        title: (body.match(/<title>([^<]*)<\/title>/) || [])[1] || null,
+        start: body.slice(0, 300),
+        aroundNudity: i >= 0 ? body.slice(Math.max(0, i - 200), i + 600) : null,
+        parsed: parseParentsGuide(body),
+      });
+    } catch (e) {
+      return send(200, { error: String(e) });
+    }
+  }
   if (path === '/manifest.json') return send(200, manifest);
   let m = path.match(/^\/stream\/([^/]+)\/(.+)$/);
   if (m) return send(200, await handleStream(m[1], m[2]));
