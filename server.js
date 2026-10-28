@@ -172,4 +172,10 @@ const server = http.createServer(handler);
 if (require.main === module) {
   server.listen(PORT, () => console.log(`Nudity Guard: http://127.0.0.1:${PORT}/manifest.json`));
 }
-module.exports = { parseParentsGuide, buildStream, server, handler };
+// Export the request handler itself as the default export: Vercel (and similar hosts)
+// require the default export to be a function.
+module.exports = handler;
+module.exports.handler = handler;
+module.exports.parseParentsGuide = parseParentsGuide;
+module.exports.buildStream = buildStream;
+module.exports.server = server;
