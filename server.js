@@ -152,6 +152,34 @@ async function handler(req, res) {
   const qp = u.searchParams.get('path');
   if (qp !== null) path = '/' + qp.replace(/^\/+/, '');
 
+  if (path === '/probe2') {
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+    const H = { 'User-Agent': UA, 'Accept': 'text/html,application/json,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };
+    const out = {};
+    try {
+      const r = await fetch('https://v3-cinemeta.strem.io/meta/movie/tt0133093.json', { headers: H, signal: AbortSignal.timeout(7000) });
+      const j = await r.json();
+      out.cinemeta = { status: r.status, name: j.meta && j.meta.name, year: j.meta && j.meta.year };
+    } catch (e) { out.cinemeta = { error: String(e).slice(0, 120) }; }
+    try {
+      const r = await fetch('https://www.commonsensemedia.org/movie-reviews/the-matrix', { headers: H, signal: AbortSignal.timeout(8000) });
+      const b = await r.text();
+      out.csm = { status: r.status, length: b.length, hasLdJson: b.includes('application/ld+json') };
+      const hits = [];
+      const re = /Sex,?\s*(Romance)?[^<]{0,20}Nudity/gi;
+      let m;
+      while ((m = re.exec(b)) && hits.length < 3) hits.push(b.slice(Math.max(0, m.index - 300), m.index + 700));
+      out.csm.around = hits;
+      const t = b.match(/<title>([^<]*)<\/title>/);
+      out.csm.title = t && t[1];
+    } catch (e) { out.csm = { error: String(e).slice(0, 120) }; }
+    try {
+      const r = await fetch('https://www.commonsensemedia.org/search/the%20matrix', { headers: H, signal: AbortSignal.timeout(8000) });
+      const b = await r.text();
+      out.csmSearch = { status: r.status, length: b.length, links: (b.match(/\/(movie|tv)-reviews\/[a-z0-9-]+/g) || []).slice(0, 8) };
+    } catch (e) { out.csmSearch = { error: String(e).slice(0, 120) }; }
+    return send(200, out);
+  }
   if (path === '/probe') {
     const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
     const H = { 'User-Agent': UA, 'Accept': 'text/html,application/json,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };
